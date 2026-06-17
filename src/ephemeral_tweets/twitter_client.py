@@ -10,6 +10,7 @@ import urllib.parse
 import uuid
 from dataclasses import dataclass
 from enum import Enum
+from typing import Iterator
 
 import httpx
 
@@ -17,6 +18,14 @@ from ephemeral_tweets.config import TwitterCredentials
 
 
 BASE_URL = "https://api.twitter.com"
+
+# Maximum tweets returned by GET /2/users/{id}/tweets across all pages (Twitter hard limit).
+TIMELINE_MAX_RESULTS = 3200
+# Maximum per-page result count allowed by the endpoint.
+TIMELINE_PAGE_SIZE = 100
+# Maximum liked tweets returned by GET /2/users/{id}/liked_tweets.
+LIKES_MAX_RESULTS = 800
+LIKES_PAGE_SIZE = 100
 
 
 class ApiErrorType(Enum):
@@ -42,8 +51,9 @@ class TwitterClient:
     """
     Twitter API v2 client.
 
-    Handles OAuth 1.0a request signing, rate limit tracking via response headers,
-    and typed error classification to distinguish permanent vs transient failures.
+    Handles OAuth 1.0a request signing (including query parameters per RFC 5849 §3.4.1),
+    rate limit tracking via response headers, and typed error classification to distinguish
+    permanent vs transient failures.
     """
 
     def __init__(self, credentials: TwitterCredentials, delay: float = 1.0) -> None:
@@ -62,12 +72,18 @@ class TwitterClient:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def _sign_request(self, method: str, url: str) -> str:
+    def _sign_request(
+        self,
+        method: str,
+        url: str,
+        query_params: dict[str, str] | None = None,
+    ) -> str:
         """
-        Build OAuth 1.0a Authorization header.
+        Build OAuth 1.0a Authorization header per RFC 5849 §3.4.
 
-        Implements HMAC-SHA1 signing per https://developer.twitter.com/en/docs/authentication/oauth-1-0a
-        for requests with no body parameters (DELETE, GET with no query).
+        Per spec, ALL request parameters (OAuth params + query string params) must be
+        merged and sorted before building the signature base string. Omitting query params
+        from the signature causes 401 on any GET endpoint that uses them.
         """
         oauth_params = {
             "oauth_consumer_key": self._creds.consumer_key,
@@ -78,14 +94,21 @@ class TwitterClient:
             "oauth_version": "1.0",
         }
 
+        # Merge query params into the parameter set for signing (do NOT include in header).
+        all_params: dict[str, str] = {**oauth_params}
+        if query_params:
+            all_params.update(query_params)
+
         param_string = "&".join(
             f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(v, safe='')}"
-            for k, v in sorted(oauth_params.items())
+            for k, v in sorted(all_params.items())
         )
+        # Use the base URL (no query string) in the signature base string.
+        base_url = url.split("?")[0]
         base_string = "&".join(
             [
                 method.upper(),
-                urllib.parse.quote(url, safe=""),
+                urllib.parse.quote(base_url, safe=""),
                 urllib.parse.quote(param_string, safe=""),
             ]
         )
@@ -100,6 +123,7 @@ class TwitterClient:
         ).digest()
         oauth_params["oauth_signature"] = base64.b64encode(digest).decode()
 
+        # Authorization header contains only oauth_* params, not query params.
         header_parts = ", ".join(
             f'{urllib.parse.quote(k, safe="")}="{urllib.parse.quote(v, safe="")}"'
             for k, v in sorted(oauth_params.items())
@@ -161,13 +185,133 @@ class TwitterClient:
         )
 
     def wait_for_rate_limit(self) -> None:
-        """Block until the rate limit window resets if the limit is exhausted."""
+        """Block until the rate limit window resets if the limit is exhausted.
+
+        Falls back to a 60-second sleep when x-rate-limit-reset was absent from the
+        last response — avoids an immediate retry with zero wait on malformed 429s.
+        """
         if self._rate_limit_remaining is not None and self._rate_limit_remaining <= 0:
             if self._rate_limit_reset:
                 wait = self._rate_limit_reset - time.time() + 5.0  # 5s safety buffer
-                if wait > 0:
-                    print(f"Rate limited. Sleeping {wait:.0f}s until reset...", flush=True)
-                    time.sleep(wait)
+            else:
+                wait = 60.0  # conservative fallback when the reset header was missing
+            if wait > 0:
+                print(f"Rate limited. Sleeping {wait:.0f}s until reset...", flush=True)
+                time.sleep(wait)
+
+    def _get_with_retry(self, url: str, params: dict[str, str]) -> dict:
+        """
+        Perform a rate-limit-aware GET with query params, returning the parsed JSON body.
+
+        Retries once on 429 after sleeping. Raises RuntimeError on auth failure or
+        persistent errors so callers get a clear message rather than a raw traceback.
+        """
+        for attempt in range(2):
+            self.wait_for_rate_limit()
+            response = self._http.get(
+                url,
+                params=params,
+                headers={"Authorization": self._sign_request("GET", url, params)},
+            )
+            self._update_rate_limits(response.headers)
+
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code == 429:
+                if attempt == 0:
+                    # Force a sleep using the reset header from this 429 response.
+                    self._rate_limit_remaining = 0
+                    self.wait_for_rate_limit()
+                    continue
+                raise RuntimeError("Rate limited twice in a row fetching from API. Try again later.")
+            if response.status_code in (401, 403):
+                raise RuntimeError(
+                    f"Authentication failed ({response.status_code}). "
+                    "Check your credentials and ensure Read+Write permissions are set. "
+                    f"Details: {response.text[:300]}"
+                )
+            raise RuntimeError(
+                f"Unexpected response {response.status_code} from {url}: {response.text[:300]}"
+            )
+
+    def get_user_tweets(self, user_id: str) -> Iterator[dict]:
+        """
+        Paginate through GET /2/users/{id}/tweets and yield tweet dicts.
+
+        Yields up to TIMELINE_MAX_RESULTS (3,200) tweets total — Twitter's hard limit.
+        Each yielded dict has: tweet_id, created_at (ISO 8601), text_preview,
+        full_text, like_count, retweet_count.
+
+        On the next run after deletions, the window slides back and older tweets
+        become accessible, so repeated runs progressively drain the full archive.
+        """
+        url = f"{BASE_URL}/2/users/{user_id}/tweets"
+        params: dict[str, str] = {
+            "max_results": str(TIMELINE_PAGE_SIZE),
+            "tweet.fields": "created_at,public_metrics",
+            "exclude": "retweets",  # only original tweets; remove this to include RTs
+        }
+        fetched = 0
+
+        while fetched < TIMELINE_MAX_RESULTS:
+            data = self._get_with_retry(url, params)
+            tweets = data.get("data", [])
+            if not tweets:
+                break  # no more tweets
+
+            for t in tweets:
+                yield {
+                    "tweet_id": t["id"],
+                    "created_at": t.get("created_at"),  # ISO 8601 from API
+                    "text_preview": t.get("text", "")[:100],
+                    "full_text": t.get("text", ""),
+                    "like_count": t.get("public_metrics", {}).get("like_count", 0),
+                    "retweet_count": t.get("public_metrics", {}).get("retweet_count", 0),
+                }
+            fetched += len(tweets)
+
+            next_token = data.get("meta", {}).get("next_token")
+            if not next_token:
+                break
+
+            params = {**params, "pagination_token": next_token}
+            time.sleep(self._delay)
+
+    def get_user_liked_tweets(self, user_id: str) -> Iterator[dict]:
+        """
+        Paginate through GET /2/users/{id}/liked_tweets and yield like dicts.
+
+        Yields up to LIKES_MAX_RESULTS (800) liked tweets — Twitter's hard limit for
+        this endpoint. Each dict has: tweet_id, created_at (None — not returned by
+        this endpoint), text_preview.
+        """
+        url = f"{BASE_URL}/2/users/{user_id}/liked_tweets"
+        params: dict[str, str] = {
+            "max_results": str(LIKES_PAGE_SIZE),
+            "tweet.fields": "id,text",
+        }
+        fetched = 0
+
+        while fetched < LIKES_MAX_RESULTS:
+            data = self._get_with_retry(url, params)
+            likes = data.get("data", [])
+            if not likes:
+                break
+
+            for t in likes:
+                yield {
+                    "tweet_id": t["id"],
+                    "created_at": None,  # liked_tweets endpoint does not return created_at
+                    "text_preview": t.get("text", "")[:100],
+                }
+            fetched += len(likes)
+
+            next_token = data.get("meta", {}).get("next_token")
+            if not next_token:
+                break
+
+            params = {**params, "pagination_token": next_token}
+            time.sleep(self._delay)
 
     def delete_tweet(self, tweet_id: str) -> ApiResponse:
         """DELETE /2/tweets/{id}"""

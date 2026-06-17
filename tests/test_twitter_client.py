@@ -131,7 +131,6 @@ class TestOAuthHeader:
     def test_different_nonce_each_call(self, client: TwitterClient) -> None:
         h1 = client._sign_request("DELETE", "https://api.twitter.com/2/tweets/123")
         h2 = client._sign_request("DELETE", "https://api.twitter.com/2/tweets/123")
-        # Extract nonce values — they must differ
         nonce1 = re.search(r'oauth_nonce="([^"]+)"', h1).group(1)
         nonce2 = re.search(r'oauth_nonce="([^"]+)"', h2).group(1)
         assert nonce1 != nonce2
@@ -189,10 +188,9 @@ class TestWaitForRateLimit:
             mock_sleep.assert_not_called()
 
     def test_sleeps_when_remaining_is_zero(self, client: TwitterClient) -> None:
-        import time as time_mod
         client._rate_limit_remaining = 0
-        client._rate_limit_reset = time_mod.time() + 60
-        with patch("time.sleep") as mock_sleep:
+        client._rate_limit_reset = 1_000_060.0
+        with patch("time.time", return_value=1_000_000.0), patch("time.sleep") as mock_sleep:
             client.wait_for_rate_limit()
             mock_sleep.assert_called_once()
             wait_arg = mock_sleep.call_args[0][0]
@@ -204,3 +202,110 @@ class TestWaitForRateLimit:
         with patch("time.sleep") as mock_sleep:
             client.wait_for_rate_limit()
             mock_sleep.assert_not_called()
+
+    def test_fallback_60s_sleep_when_reset_header_absent(self, client: TwitterClient) -> None:
+        # Bug fix: absent x-rate-limit-reset must not silently skip the sleep.
+        client._rate_limit_remaining = 0
+        client._rate_limit_reset = None  # no reset header was ever received
+        with patch("time.sleep") as mock_sleep:
+            client.wait_for_rate_limit()
+            mock_sleep.assert_called_once_with(60.0)
+
+
+class TestOAuthSignWithQueryParams:
+    """OAuth 1.0a spec (RFC 5849 §3.4.1) requires query params in the signature base string."""
+
+    def test_query_params_included_in_signature_base(self, client: TwitterClient) -> None:
+        url = "https://api.twitter.com/2/users/123/tweets"
+        header_no_params = client._sign_request("GET", url)
+        header_with_params = client._sign_request("GET", url, {"max_results": "100"})
+        sig_no = re.search(r'oauth_signature="([^"]+)"', header_no_params).group(1)
+        sig_with = re.search(r'oauth_signature="([^"]+)"', header_with_params).group(1)
+        assert sig_no != sig_with
+
+    def test_query_params_not_in_header(self, client: TwitterClient) -> None:
+        header = client._sign_request("GET", "https://api.twitter.com/2/users/123/tweets",
+                                       {"max_results": "100", "tweet.fields": "created_at"})
+        assert "max_results" not in header
+        assert "tweet.fields" not in header
+
+    def test_header_still_valid_oauth_format(self, client: TwitterClient) -> None:
+        header = client._sign_request("GET", "https://api.twitter.com/2/users/123/tweets",
+                                       {"max_results": "100"})
+        assert header.startswith("OAuth ")
+        assert "oauth_signature=" in header
+        assert "oauth_consumer_key" in header
+
+
+class TestGetUserTweets:
+    def test_yields_tweets_from_single_page(self, client: TwitterClient) -> None:
+        api_response = {
+            "data": [
+                {"id": "1", "created_at": "2024-01-01T00:00:00Z", "text": "hello", "public_metrics": {"like_count": 3, "retweet_count": 1}},
+                {"id": "2", "created_at": "2024-01-02T00:00:00Z", "text": "world", "public_metrics": {"like_count": 0, "retweet_count": 0}},
+            ],
+            "meta": {},
+        }
+        with patch.object(client, "_get_with_retry", return_value=api_response):
+            tweets = list(client.get_user_tweets("u1"))
+        assert len(tweets) == 2
+        assert tweets[0]["tweet_id"] == "1"
+        assert tweets[0]["like_count"] == 3
+        assert tweets[0]["created_at"] == "2024-01-01T00:00:00Z"
+        assert len(tweets[0]["text_preview"]) <= 100
+
+    def test_paginates_with_next_token(self, client: TwitterClient) -> None:
+        page1 = {
+            "data": [{"id": "1", "created_at": "2024-01-01T00:00:00Z", "text": "p1", "public_metrics": {}}],
+            "meta": {"next_token": "tok123"},
+        }
+        page2 = {
+            "data": [{"id": "2", "created_at": "2024-01-02T00:00:00Z", "text": "p2", "public_metrics": {}}],
+            "meta": {},
+        }
+        with patch.object(client, "_get_with_retry", side_effect=[page1, page2]), \
+             patch("time.sleep"):
+            tweets = list(client.get_user_tweets("u1"))
+        assert len(tweets) == 2
+        assert tweets[0]["tweet_id"] == "1"
+        assert tweets[1]["tweet_id"] == "2"
+
+    def test_stops_when_no_data(self, client: TwitterClient) -> None:
+        with patch.object(client, "_get_with_retry", return_value={"data": [], "meta": {}}):
+            tweets = list(client.get_user_tweets("u1"))
+        assert tweets == []
+
+    def test_stops_when_data_key_absent(self, client: TwitterClient) -> None:
+        with patch.object(client, "_get_with_retry", return_value={"meta": {}}):
+            tweets = list(client.get_user_tweets("u1"))
+        assert tweets == []
+
+
+class TestGetUserLikedTweets:
+    def test_yields_liked_tweets(self, client: TwitterClient) -> None:
+        api_response = {
+            "data": [
+                {"id": "L1", "text": "liked tweet one"},
+                {"id": "L2", "text": "liked tweet two"},
+            ],
+            "meta": {},
+        }
+        with patch.object(client, "_get_with_retry", return_value=api_response):
+            likes = list(client.get_user_liked_tweets("u1"))
+        assert len(likes) == 2
+        assert likes[0]["tweet_id"] == "L1"
+        assert likes[0]["created_at"] is None
+        assert likes[0]["text_preview"] == "liked tweet one"
+
+    def test_stops_on_empty_data(self, client: TwitterClient) -> None:
+        with patch.object(client, "_get_with_retry", return_value={"data": [], "meta": {}}):
+            likes = list(client.get_user_liked_tweets("u1"))
+        assert likes == []
+
+    def test_paginates(self, client: TwitterClient) -> None:
+        page1 = {"data": [{"id": "L1", "text": "a"}], "meta": {"next_token": "ntok"}}
+        page2 = {"data": [{"id": "L2", "text": "b"}], "meta": {}}
+        with patch.object(client, "_get_with_retry", side_effect=[page1, page2]), \
+             patch("time.sleep"):
+            likes = list(client.get_user_liked_tweets("u1"))
+        assert [l["tweet_id"] for l in likes] == ["L1", "L2"]

@@ -74,16 +74,27 @@ def init() -> None:
     save_config(config)
     click.echo(f"\nConfig saved to: {CONFIG_PATH}")
     click.echo("\nNext steps:")
+    click.echo("  ephemeral-tweets delete --from-account --dry-run")
     click.echo("  ephemeral-tweets delete --file ~/twitter-archive/data/tweets.js --dry-run")
-    click.echo("  ephemeral-tweets unlike --file ~/twitter-archive/data/like.js --dry-run")
+    click.echo("  ephemeral-tweets unlike --from-account --dry-run")
 
 
 @cli.command("delete")
 @click.option(
     "--file", "archive_file",
-    required=True,
+    default=None,
     type=click.Path(exists=True, dir_okay=False, readable=True),
     help="Path to tweets.js from your Twitter/X data archive.",
+)
+@click.option(
+    "--from-account",
+    is_flag=True,
+    default=False,
+    help=(
+        "Fetch tweets directly from your Twitter account via the API "
+        "(no archive file needed). Returns up to 3,200 most recent tweets. "
+        "Re-run after deletion to process the next sliding window."
+    ),
 )
 @click.option(
     "--older-than",
@@ -117,7 +128,8 @@ def init() -> None:
     help="Spare tweets with at least N retweets.",
 )
 def delete_cmd(
-    archive_file: str,
+    archive_file: str | None,
+    from_account: bool,
     older_than: int | None,
     dry_run: bool,
     spare_ids: tuple[str, ...],
@@ -126,18 +138,36 @@ def delete_cmd(
 ) -> None:
     """Delete old tweets from your account.
 
-    Reads a tweets.js file from a Twitter/X data archive and deletes tweets
-    older than the configured threshold. Progress is saved to a local SQLite
-    database so the command can be safely interrupted and resumed.
+    Provide either --file (archive mode) or --from-account (live API mode).
+
+    Archive mode reads tweets.js from a Twitter/X data archive. Account mode
+    fetches up to 3,200 tweets directly from the API — re-run after deletion
+    to process the next sliding window of older tweets.
+
+    Progress is saved to a local SQLite database so runs can be safely
+    interrupted and resumed.
 
     \b
     Examples:
+      ephemeral-tweets delete --from-account --dry-run
+      ephemeral-tweets delete --from-account --older-than 60
       ephemeral-tweets delete --file ~/twitter/tweets.js
       ephemeral-tweets delete --file ~/twitter/tweets.js --older-than 60 --dry-run
       ephemeral-tweets delete --file ~/twitter/tweets.js --spare-min-likes 10
     """
     from ephemeral_tweets.config import load_config
-    from ephemeral_tweets.service import delete_tweets
+    from ephemeral_tweets.service import delete_tweets, delete_tweets_from_account
+
+    if not archive_file and not from_account:
+        click.echo(
+            "Error: provide either --file <tweets.js> or --from-account.", err=True
+        )
+        sys.exit(1)
+    if archive_file and from_account:
+        click.echo(
+            "Error: --file and --from-account are mutually exclusive.", err=True
+        )
+        sys.exit(1)
 
     try:
         config = load_config()
@@ -145,15 +175,22 @@ def delete_cmd(
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
-    result = delete_tweets(
-        config=config,
-        archive_path=archive_file,
+    common_kwargs = dict(
         older_than_days=older_than,
         dry_run=dry_run,
         spare_ids=set(spare_ids),
         spare_min_likes=spare_min_likes,
         spare_min_retweets=spare_min_retweets,
     )
+
+    try:
+        if from_account:
+            result = delete_tweets_from_account(config=config, **common_kwargs)
+        else:
+            result = delete_tweets(config=config, archive_path=archive_file, **common_kwargs)
+    except RuntimeError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
 
     click.echo()
     if dry_run:
@@ -171,28 +208,54 @@ def delete_cmd(
 @cli.command("unlike")
 @click.option(
     "--file", "archive_file",
-    required=True,
+    default=None,
     type=click.Path(exists=True, dir_okay=False, readable=True),
     help="Path to like.js from your Twitter/X data archive.",
+)
+@click.option(
+    "--from-account",
+    is_flag=True,
+    default=False,
+    help=(
+        "Fetch likes directly from your Twitter account via the API "
+        "(no archive file needed). Returns up to 800 liked tweets."
+    ),
 )
 @click.option(
     "--dry-run",
     is_flag=True,
     help="Show what would be unliked without making any API calls.",
 )
-def unlike_cmd(archive_file: str, dry_run: bool) -> None:
+def unlike_cmd(archive_file: str | None, from_account: bool, dry_run: bool) -> None:
     """Remove likes from your account.
 
-    Reads a like.js file from a Twitter/X data archive and unlikes all
-    tweets listed. Progress is saved to SQLite so it can be resumed.
+    Provide either --file (archive mode) or --from-account (live API mode).
+
+    Archive mode reads like.js from a Twitter/X data archive. Account mode
+    fetches up to 800 liked tweets directly from the API.
+
+    Progress is saved to SQLite so runs can be resumed.
 
     \b
     Examples:
+      ephemeral-tweets unlike --from-account --dry-run
+      ephemeral-tweets unlike --from-account
       ephemeral-tweets unlike --file ~/twitter/like.js
       ephemeral-tweets unlike --file ~/twitter/like.js --dry-run
     """
     from ephemeral_tweets.config import load_config
-    from ephemeral_tweets.service import unlike_tweets
+    from ephemeral_tweets.service import unlike_tweets, unlike_tweets_from_account
+
+    if not archive_file and not from_account:
+        click.echo(
+            "Error: provide either --file <like.js> or --from-account.", err=True
+        )
+        sys.exit(1)
+    if archive_file and from_account:
+        click.echo(
+            "Error: --file and --from-account are mutually exclusive.", err=True
+        )
+        sys.exit(1)
 
     try:
         config = load_config()
@@ -201,7 +264,10 @@ def unlike_cmd(archive_file: str, dry_run: bool) -> None:
         sys.exit(1)
 
     try:
-        result = unlike_tweets(config=config, archive_path=archive_file, dry_run=dry_run)
+        if from_account:
+            result = unlike_tweets_from_account(config=config, dry_run=dry_run)
+        else:
+            result = unlike_tweets(config=config, archive_path=archive_file, dry_run=dry_run)
     except RuntimeError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -226,7 +292,7 @@ def status() -> None:
     from ephemeral_tweets.db.repository import TweetRepository
 
     if not DB_PATH.exists():
-        click.echo("No database found. Run 'ephemeral-tweets delete --file tweets.js' first.")
+        click.echo("No database found. Run 'ephemeral-tweets delete --from-account' first.")
         return
 
     repo = TweetRepository()
@@ -240,14 +306,14 @@ def status() -> None:
     click.echo("ephemeral-tweets status")
     click.echo("=" * 40)
 
-    click.echo(f"\nTweets (from tweets.js):")
+    click.echo(f"\nTweets:")
     click.echo(f"  Total tracked : {tweet_counts['total']}")
     click.echo(f"  Deleted       : {tweet_counts['deleted']}")
     click.echo(f"  Pending       : {tweet_counts['pending']}")
     click.echo(f"  Skipped       : {tweet_counts['skipped']}")
     click.echo(f"  Failed        : {tweet_counts['failed_permanent']}")
 
-    click.echo(f"\nLikes (from like.js):")
+    click.echo(f"\nLikes:")
     click.echo(f"  Total tracked : {like_counts['total']}")
     click.echo(f"  Unliked       : {like_counts['deleted']}")
     click.echo(f"  Pending       : {like_counts['pending']}")

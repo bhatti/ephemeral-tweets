@@ -13,13 +13,17 @@ The old `deletetweets` package uses the deprecated Twitter API v1.1, has no pers
 from scratch every run), and doesn't respect rate limiting in a way that works with current X
 throttling. `ephemeral-tweets` fixes all of that:
 
+- **Two modes** — feed it a `tweets.js` archive file *or* point it directly at your account
+  (`--from-account`) with no archive needed
+- **Sliding window** — Twitter returns the 3,200 most recent tweets per run; after you delete them,
+  re-running fetches the next batch of older tweets automatically
 - **Resumable** — progress is saved to SQLite; interrupted runs pick up where they left off
-- **Idempotent** — running the same archive file twice is safe; already-processed tweets are skipped
+- **Idempotent** — running the same command twice is safe; already-processed tweets are skipped
 - **Rate-limit-aware** — reads `x-rate-limit-remaining` / `x-rate-limit-reset` from every API
-  response and sleeps precisely until the window resets
+  response and sleeps precisely until the window resets; random jitter avoids request fingerprinting
 - **Smart error handling** — permanent failures (auth errors) stop immediately; transient server
   errors retry with exponential backoff; 404s (already deleted) count as success
-- **Likes support** — unlike tweets from your `like.js` archive
+- **Likes support** — unlike tweets from your `like.js` archive or directly from the API
 
 ---
 
@@ -35,13 +39,31 @@ Unlike (removing likes) may work on the free tier, but this is subject to Twitte
 
 ---
 
+## Authentication: API keys only, no cookie scraping
+
+`ephemeral-tweets` uses **OAuth 1.0a** (Twitter's official API authentication) — it never handles
+your browser cookies or session tokens.
+
+**Why not cookies?**
+
+Using browser cookies to call the Twitter API directly ("copy cookie from browser") violates
+Twitter's Terms of Service and can result in immediate account suspension. Tools that do this
+(e.g. `twitter-scraper`, some `tweepy` alternatives) work until Twitter detects the pattern and
+bans the account. The official API is slower but safe.
+
+You need a **Twitter Developer App** with four OAuth 1.0a keys (see setup below). The tool signs
+every request with those keys using HMAC-SHA1 — the standard approach for server-side Twitter apps.
+
+---
+
 ## Requirements
 
 - Python 3.11+
 - Twitter/X Developer App with **OAuth 1.0a User Authentication** and **Read and Write permissions**
   (see setup below)
-- Your [Twitter/X data archive](https://help.twitter.com/en/managing-your-account/how-to-download-your-twitter-archive)
-  containing `tweets.js` and/or `like.js`
+- Basic API tier or higher for tweet deletion ($100/month)
+- Optionally: your [Twitter/X data archive](https://help.twitter.com/en/managing-your-account/how-to-download-your-twitter-archive)
+  (only needed if you prefer archive mode over `--from-account`)
 
 ---
 
@@ -73,14 +95,20 @@ steps exactly — missing any step is the most common source of 401/403 errors.
 3. If prompted, apply for developer access and fill in the required use-case description
 4. Once approved, click **"+ Add App"** or **"Create Project"**
 
-### Step 2: Create an App
+### Step 2: Upgrade to Basic Tier (required for deletion)
+
+1. In the developer portal, click your project name
+2. Under **"Subscription"**, upgrade to **Basic** ($100/month) or higher
+3. Without this, all `delete` calls will return `403 Forbidden`
+
+### Step 3: Create an App
 
 1. Inside your project, click **"Add App"**
 2. Choose a unique app name (e.g. `my-ephemeral-tweets`)
 3. Copy the **API Key** (Consumer Key) and **API Secret** (Consumer Secret) shown at this step —
    store them securely, you may not see them again
 
-### Step 3: Configure User Authentication
+### Step 4: Configure User Authentication
 
 1. In your app's settings, find **"User authentication settings"** and click **"Set up"**
 2. Set **App permissions** to **"Read and Write"** (not just Read — write is required to delete)
@@ -90,9 +118,9 @@ steps exactly — missing any step is the most common source of 401/403 errors.
 5. Save the settings
 
 > **Important:** If you later change the app permissions, you must regenerate your Access Token and
-> Secret (step 4) — the old tokens will not pick up the new permissions.
+> Secret (step 5) — the old tokens will not pick up the new permissions.
 
-### Step 4: Generate Access Token and Secret
+### Step 5: Generate Access Token and Secret
 
 1. In your app's **"Keys and Tokens"** tab, scroll to **"Authentication Tokens"**
 2. Click **"Generate"** next to **Access Token and Secret**
@@ -104,7 +132,7 @@ You now have four values:
 - Access Token
 - Access Token Secret
 
-### Step 5: Configure ephemeral-tweets
+### Step 6: Configure ephemeral-tweets
 
 ```bash
 ephemeral-tweets init
@@ -116,41 +144,57 @@ atomically so they are never world-readable even briefly.
 
 ---
 
-## Getting Your Twitter Archive
-
-1. Log into Twitter/X → **Settings** → **Your account** → **Download an archive of your data**
-2. Confirm your identity and request the archive
-3. Wait for the email notification (can take up to 24 hours for large accounts)
-4. Download and extract the ZIP file
-5. Locate the relevant files inside the `data/` folder:
-   - `data/tweets.js` — all your tweets
-   - `data/like.js` — all your likes (note: `likes.js` on some newer archives)
-
-> **Large accounts:** Twitter splits archives across multiple part files
-> (`tweets-part1.js`, `tweets-part2.js`, etc.). Run `ephemeral-tweets delete` once for each part
-> file — the SQLite database deduplicates across runs automatically.
-
----
-
 ## Quick Start
 
 ```bash
 # 1. Configure credentials (one-time)
 ephemeral-tweets init
 
-# 2. Preview what would be deleted (no API calls made)
-ephemeral-tweets delete --file ~/Downloads/twitter-archive/data/tweets.js --dry-run
+# ── Account mode (no archive needed) ──────────────────────────────────────────
 
-# 3. Delete tweets older than 30 days (default)
+# 2. Preview what would be deleted (no API calls made)
+ephemeral-tweets delete --from-account --dry-run
+
+# 3. Delete tweets older than 30 days (default); fetches up to 3,200 most recent
+ephemeral-tweets delete --from-account
+
+# 4. Run again after the first batch is deleted — fetches the next sliding window
+ephemeral-tweets delete --from-account
+
+# 5. Unlike all your likes from the API
+ephemeral-tweets unlike --from-account --dry-run
+ephemeral-tweets unlike --from-account
+
+# ── Archive mode (tweets.js / like.js) ────────────────────────────────────────
+
+# 6. Delete from a downloaded archive
 ephemeral-tweets delete --file ~/Downloads/twitter-archive/data/tweets.js
 
-# 4. Unlike all likes in your archive
-ephemeral-tweets unlike --file ~/Downloads/twitter-archive/data/like.js --dry-run
+# 7. Unlike from archive
 ephemeral-tweets unlike --file ~/Downloads/twitter-archive/data/like.js
 
-# 5. Check progress
+# 8. Check progress
 ephemeral-tweets status
 ```
+
+### Deleting more than 3,200 tweets
+
+Twitter hard-limits the timeline API to 3,200 results per run. To delete your entire history:
+
+```bash
+# Run repeatedly until all pending tweets are gone:
+while true; do
+    ephemeral-tweets delete --from-account
+    # Check if any pending remain
+    pending=$(ephemeral-tweets status | grep "Pending" | head -1 | awk '{print $NF}')
+    [ "$pending" = "0" ] && break
+    echo "Sleeping 15 minutes before next run..."
+    sleep 900
+done
+```
+
+Each run fetches the current 3,200 most recent tweets. After deleting them, the window slides
+backward and the next run sees the previously-hidden older tweets.
 
 ---
 
@@ -165,11 +209,12 @@ Interactive setup. Prompts for the four OAuth credentials and default settings. 
 
 ### `ephemeral-tweets delete`
 
-Delete old tweets from your account.
+Delete old tweets from your account. Provide **one of** `--file` or `--from-account`.
 
 ```
 Options:
-  --file PATH              tweets.js from your Twitter archive  [required]
+  --file PATH              tweets.js from your Twitter archive
+  --from-account           Fetch tweets directly from the Twitter API (no archive needed)
   --older-than INTEGER     Delete tweets older than N days (default: from config, usually 30)
   --dry-run                Show what would be deleted without making any API calls
   --spare-ids TWEET_ID     Tweet ID to never delete (repeat for multiple)
@@ -181,17 +226,15 @@ Options:
 **Examples:**
 
 ```bash
-# Delete tweets older than 60 days
+# Account mode (recommended — no archive download needed)
+ephemeral-tweets delete --from-account
+ephemeral-tweets delete --from-account --older-than 60
+ephemeral-tweets delete --from-account --spare-min-likes 5
+
+# Archive mode
 ephemeral-tweets delete --file tweets.js --older-than 60
-
-# Keep popular tweets
 ephemeral-tweets delete --file tweets.js --spare-min-likes 5 --spare-min-retweets 2
-
-# Keep specific tweet IDs
 ephemeral-tweets delete --file tweets.js --spare-ids 1234567890 --spare-ids 9876543210
-
-# Dry run to preview
-ephemeral-tweets delete --file tweets.js --dry-run
 ```
 
 > **Re-running with different spare criteria:** Tweets marked `skipped` in a previous run remain
@@ -203,21 +246,25 @@ ephemeral-tweets delete --file tweets.js --dry-run
 
 ### `ephemeral-tweets unlike`
 
-Remove likes from your account.
+Remove likes from your account. Provide **one of** `--file` or `--from-account`.
 
 ```
 Options:
-  --file PATH    like.js (or likes.js) from your Twitter archive  [required]
-  --dry-run      Show what would be unliked without making any API calls
-  --help         Show this message and exit
+  --file PATH      like.js (or likes.js) from your Twitter archive
+  --from-account   Fetch liked tweets directly from the Twitter API (up to 800)
+  --dry-run        Show what would be unliked without making any API calls
+  --help           Show this message and exit
 ```
 
-> **Note:** Likes have no timestamp in the Twitter archive — the unlike command removes **all**
-> likes listed in the archive file, not just old ones.
+> **Note:** Archive likes have no timestamp — the unlike command removes **all** likes listed,
+> not just old ones. Account mode (`--from-account`) also has no date filter — use it to clear
+> all likes.
 
 **Examples:**
 
 ```bash
+ephemeral-tweets unlike --from-account --dry-run
+ephemeral-tweets unlike --from-account
 ephemeral-tweets unlike --file ~/twitter-archive/data/like.js --dry-run
 ephemeral-tweets unlike --file ~/twitter-archive/data/like.js
 ```
@@ -238,14 +285,14 @@ ephemeral-tweets status
 ephemeral-tweets status
 ========================================
 
-Tweets (from tweets.js):
+Tweets:
   Total tracked : 4832
   Deleted       : 3201
   Pending       : 1421
   Skipped       : 150
   Failed        : 60
 
-Likes (from like.js):
+Likes:
   Total tracked : 9100
   Unliked       : 9100
   Pending       : 0
@@ -278,7 +325,7 @@ access_token_secret = "..."
 
 [settings]
 older_than_days = 30          # Age threshold for deletion
-delay_between_requests = 1.0  # Seconds between API calls; increase if still hitting limits
+delay_between_requests = 1.0  # Base seconds between API calls; jitter of up to 30% is added
 max_retries = 3               # Retries on transient 5xx server errors
 ```
 
@@ -297,8 +344,11 @@ Every API response from Twitter includes rate limit headers:
 - `x-rate-limit-reset` — Unix timestamp when the window resets
 
 `ephemeral-tweets` reads these headers on every response. Before each request, if the remaining
-count is zero it sleeps until the reset timestamp plus a 5-second safety buffer. No fixed delays,
-no guessing.
+count is zero it sleeps until the reset timestamp plus a 5-second safety buffer.
+
+Between requests, the tool sleeps for `delay_between_requests` seconds plus a random jitter of
+up to 30%. The jitter prevents a predictable fixed-interval request pattern that Twitter could
+detect as automated traffic.
 
 After receiving a `429 Too Many Requests`, it waits and retries once. If still throttled, the tweet
 stays `pending` so the next run can retry — it is never permanently marked as failed due to rate
@@ -327,9 +377,18 @@ four statuses:
 | `skipped` | Excluded by age/spare criteria — permanent once set |
 | `failed_permanent` | Permanent failure (auth error, persistent unknown error) |
 
-On each run, the archive is re-parsed but only `pending` rows are sent to the API. Status updates
-are committed to SQLite after each individual tweet, so a crash or `Ctrl-C` loses at most one
-in-flight operation.
+On each run, only `pending` rows are sent to the API. Status updates are committed to SQLite after
+each individual tweet, so a crash or `Ctrl-C` loses at most one in-flight operation.
+
+### Sliding Window (account mode)
+
+Twitter's timeline API returns at most 3,200 of your *most recent* tweets. After you delete that
+batch, your timeline shifts: tweets that were previously beyond the 3,200 limit are now accessible.
+Each run of `--from-account` fetches the current visible window, deletes what matches your criteria,
+and leaves the rest. Re-run to expose and delete the next batch.
+
+The SQLite database ensures tweets deleted in a previous run are never re-processed: `INSERT OR IGNORE`
+means already-tracked tweet IDs are not re-inserted, so they won't appear as pending on the next run.
 
 ---
 
@@ -396,17 +455,20 @@ Use a test Twitter account with a few old throwaway tweets.
 ## Known Limitations
 
 - **Paid API tier required for deletion.** See the warning at the top of this README.
-- **Likes have no timestamps.** The `unlike` command removes all likes in the archive, not just old
-  ones. There is no way to filter likes by date using the archive format.
-- **Archive is a snapshot.** Tweets posted after the archive was exported won't be in it. For
-  continuous cleanup, re-download your archive periodically and re-run.
-- **Large accounts get split archives.** Run the tool once per part file. The database deduplicates
-  automatically.
+- **3,200-tweet window per run.** Twitter hard-limits the timeline API. Re-run repeatedly to drain
+  your entire history — each run exposes older tweets as the newer ones are deleted.
+- **Likes have no timestamps.** The unlike commands (both `--file` and `--from-account`) remove all
+  likes, not just old ones. There is no way to filter likes by date.
+- **Account mode liked_tweets limited to 800.** The `GET /2/users/{id}/liked_tweets` endpoint
+  returns at most 800 results per run.
+- **Archive is a snapshot.** Tweets posted after the archive was exported won't be in it. Prefer
+  `--from-account` for continuous cleanup.
 - **Skipped status is permanent.** Once a tweet is marked `skipped` (due to spare criteria), it
   stays skipped on future runs even if you change the criteria. Delete the database to reset.
-- **Rate limits vary by tier.** Free tier: deletion not permitted. Basic tier: ~50 delete requests
-  per 15-minute window per endpoint. Pro/Enterprise: higher limits. The tool adapts automatically
-  by reading the response headers.
+- **Rate limits vary by tier.** Basic tier: ~50 delete requests per 15-minute window per endpoint.
+  The tool adapts automatically by reading response headers.
+- **No cookie/session auth.** Using browser cookies to access the Twitter API violates their ToS
+  and risks account suspension. Use OAuth 1.0a API keys only.
 
 ---
 
@@ -427,7 +489,7 @@ src/ephemeral_tweets/
 ├── config.py            # TOML config at ~/.config/ephemeral-tweets/
 ├── archive_parser.py    # Parse tweets.js / like.js archive files
 ├── twitter_client.py    # Twitter API v2 + OAuth 1.0a signing + rate limit tracking
-├── service.py           # Orchestration: parse → filter → delete with resume
+├── service.py           # Orchestration: parse/fetch → filter → delete with resume
 └── db/
     ├── migrations.py    # Versioned schema migrations
     └── repository.py    # SQLite CRUD repository
@@ -435,8 +497,8 @@ tests/
 ├── test_archive_parser.py   # Archive format parsing + edge cases
 ├── test_config.py           # Config serialization + TOML escaping + file permissions
 ├── test_repository.py       # SQLite repository + migrations
-├── test_service.py          # Orchestration logic + resume + retry
-└── test_twitter_client.py   # OAuth signing + error classification + rate limits
+├── test_service.py          # Orchestration logic + resume + retry + account mode
+└── test_twitter_client.py   # OAuth signing + pagination + error classification
 ```
 
 ---
